@@ -1,0 +1,17 @@
+[[source]]
+url = 'https://pypi.python.org/simple'
+verify_ssl = true
+name = 'pypi'
+
+[requires]
+python_version = '3.8'
+
+[packages]
+pymongo = '==3.12.1'
+requests = '*'
+emoji = "*"
+schedule = "*"
+
+[dev-packages]
+black = "==21.9b0"
+flake8 = "==4.0.1"
