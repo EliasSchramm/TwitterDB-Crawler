@@ -1,25 +1,69 @@
+from typing import List
 import emoji
 import string
 
-class Tweet():
-    def __init__(self, text: str):
-        self.text = text.lower()
-        self.hashtags = self.find("#", forbidden="@")
-        self.cleanTag()
-        self.tags = self.find("@", forbidden="#")
 
-    def find(self, prefix, forbidden):
+class Tweet:
+    def __init__(self, text: str):
+
+        self.char_blacklist = [
+            "\n",
+            "\t",
+            ".",
+            ",",
+            "(",
+            ")",
+            "{",
+            "}",
+            "-",
+            "+",
+            ":",
+            "/",
+            "\\",
+            "'",
+            '"',
+            "!",
+            "?",
+            "=",
+            "…",
+            "*",
+            "&",
+            "€",
+            "$",
+            ";",
+            "・",
+            "。",
+            "．．．",
+            "、",
+            "⋮",
+            " ",
+            " ",
+            "[",
+            "]",
+        ]
+        self.text: str = self._clean(text, self.char_blacklist)
+
+        self.text = self.text.lower()
+        self.hashtags = self._find("#", forbidden="@")
+        self._clean_tag()
+        self.tags = self._find("@", forbidden="#")
+
+    def _clean(self, text: str, forbidden: List[str]) -> str:
+        for x in forbidden:
+            text = text.replace(x, " ")
+        return text
+
+    def _find(self, prefix, forbidden):
         ret = []
         _text = self.text
         _text = _text.replace(forbidden, " ")
         _text = _text.replace("　", "")
         _text = _text.replace("！", "")
 
-
         if not _text.startswith("RT"):
 
             for word in _text.split(" "):
-                word = self.remove_emojis(word)
+                word = self._remove_emojis(word)
 
                 if len(word) >= 2 and word.count(prefix) == 1:
                     word = word.split(prefix)
@@ -31,11 +75,13 @@ class Tweet():
 
         return ret
 
-    def remove_emojis(self, s):
-        return ''.join(c for c in s if c not in emoji.UNICODE_EMOJI['en'])
+    def _remove_emojis(self, s):
+        return "".join(c for c in s if c not in emoji.UNICODE_EMOJI["en"])
 
-    def cleanTag(self):
-        allowed = list(string.ascii_lowercase + string.ascii_uppercase + string.digits) + ["_", "@", " "]
+    def _clean_tag(self):
+        allowed = list(
+            string.ascii_lowercase + string.ascii_uppercase + string.digits
+        ) + ["_", "@", " "]
 
         newtext = ""
         for letter in self.text:

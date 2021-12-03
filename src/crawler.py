@@ -1,7 +1,10 @@
-import os
-
 from pymongo import MongoClient
+from pymongo.collection import Collection
+from pymongo.cursor import Cursor
 from pymongo.database import Database
+from requests.api import patch
+
+import _secrets
 
 import requests
 import json
@@ -11,21 +14,24 @@ import datetime
 from tweet import Tweet
 from threading import Thread
 
-now = datetime.datetime.now()
-CUR_TIMESTAMP = int(datetime.datetime(year=now.year, month=now.month, day=now.day, hour=now.hour).timestamp())
-
 TOTAL_TAGS = 0
 TOTAL_HASHTAGS = 0
 TOTAL_TWEETS = 0
 TOTAL_RETWEETS = 0
 
-DATA_TAGS = {}
-DATA_HASHTAGS = {}
+SAMPLE_TWEET_INTERVALL = 25
 
-DB = 0
+DB = None
 
 
-# Twitter API stuff
+def _get_current_timestamp() -> int:
+    now = datetime.datetime.now()
+    return int(
+        datetime.datetime(
+            year=now.year, month=now.month, day=now.day, hour=now.hour
+        ).timestamp()
+    )
+
 
 def create_url():
     return "https://api.twitter.com/2/tweets/sample/stream"
@@ -38,17 +44,35 @@ def create_headers(bearer_token):
 
 def connect_to_endpoint():
     url = create_url()
-    headers = create_headers(os.environ['TWITTER_KEY'])
+    headers = create_headers(_secrets.TWITTER_API_KEY)
 
-    schedule.every().second.do(updateTimestamp)
+    schedule.every(2).seconds.do(_spawn_save_totals)
+    schedule.every().hour.at(":55").do(_spawn_calculate_tops)
 
     response = requests.request("GET", url, headers=headers, stream=True)
 
+    tweet_sample_count = 0
     for response_line in response.iter_lines():
         if response_line:
             if b"data" in response_line:
                 json_response = json.loads(response_line)
-                handleTweet(json_response["data"]["text"])
+                t = Thread(
+                    target=_handle_tweet,
+                    args=(json_response["data"]["text"], _get_current_timestamp()),
+                )
+                t.start()
+
+                if tweet_sample_count % SAMPLE_TWEET_INTERVALL == 0:
+                    DB["sampled_tweets"].insert_one(
+                        {
+                            "timestamp": int(
+                                datetime.datetime.now().timestamp() * 1000
+                            ),
+                            "tweet": json_response,
+                        }
+                    )
+                tweet_sample_count += 1
+
                 schedule.run_pending()
         if response.status_code != 200:
             print(response.status_code)
@@ -59,212 +83,132 @@ def connect_to_endpoint():
             )
 
 
-# Tweet handling
+def _handle_tweet(text: str, timestamp: str):
+    global TOTAL_TWEETS, TOTAL_RETWEETS, TOTAL_HASHTAGS, TOTAL_TAGS, DB
 
-def clean(text, forbidden):
-    for x in forbidden:
-        text = text.replace(x, " ")
-    return text
+    t = Tweet(text)
 
+    TOTAL_TWEETS += 1
+    if text.startswith("RT"):
+        TOTAL_RETWEETS += 1
 
-def handleTweet(text: str):
-    global TOTAL_TWEETS, TOTAL_RETWEETS, TOTAL_HASHTAGS, TOTAL_TAGS, DATA_HASHTAGS, DATA_TAGS
+    TOTAL_TAGS += len(t.tags)
+    TOTAL_HASHTAGS += len(t.hashtags)
 
-    try:
+    tag_collection = None
+    if t.tags:
+        tag_collection = DB["tags"]
 
-        t = Tweet(
-            clean(text, ["\n", "\t", ".", ",", "(", ")", "{", "}", "-", "+", ":", "/", "\\", "'", "\"", "!", "?",
-                         "=","…", "*", "&", "€", "$", ";", "・", "。", "．．．", "、", "⋮", " ", " ", "[", "]"]))
+    hashtag_collection = None
+    if t.hashtags:
+        hashtag_collection = DB["hashtags"]
 
-        TOTAL_TWEETS += 1
-        if text.startswith("RT"):
-            TOTAL_RETWEETS += 1
-
-        TOTAL_TAGS += len(t.tags)
-        TOTAL_HASHTAGS += len(t.hashtags)
-
-        for tag in t.tags:
-            if tag in DATA_TAGS.keys():
-                DATA_TAGS[tag] += 1
+    for tag in t.tags:
+        entry = {"name": tag, "timeline": [{"count": 1, "timestamp": timestamp}]}
+        existing_entry = tag_collection.find_one({"name": tag})
+        if existing_entry:
+            if existing_entry["timeline"][0]["timestamp"] == timestamp:
+                existing_entry["timeline"][0]["count"] += 1
             else:
-                DATA_TAGS[tag] = 1
+                existing_entry["timeline"] = [
+                    {"count": 1, "timestamp": timestamp}
+                ] + existing_entry["timeline"]
+            entry = existing_entry
 
-        for hashtag in t.hashtags:
-            if hashtag in DATA_HASHTAGS.keys():
-                DATA_HASHTAGS[hashtag] += 1
+        tag_collection.update_one({"name": tag}, {"$set": entry}, upsert=True)
+
+    for hashtag in t.hashtags:
+        entry = {"name": hashtag, "timeline": [{"count": 1, "timestamp": timestamp}]}
+        existing_entry = hashtag_collection.find_one({"name": hashtag})
+        if existing_entry:
+            if existing_entry["timeline"][0]["timestamp"] == timestamp:
+                existing_entry["timeline"][0]["count"] += 1
             else:
-                DATA_HASHTAGS[hashtag] = 1
+                existing_entry["timeline"] = [
+                    {"count": 1, "timestamp": timestamp}
+                ] + existing_entry["timeline"]
+            entry = existing_entry
 
-    except:
-        print("ERROR")
-        pass
-
-
-def updateTimestamp():
-    global CUR_TIMESTAMP
-
-    old_timestamp = CUR_TIMESTAMP
-
-    now = datetime.datetime.now()
-    _CUR_TIMESTAMP = int(datetime.datetime(year=now.year, month=now.month, day=now.day, hour=now.hour).timestamp())
-
-    if old_timestamp != _CUR_TIMESTAMP and old_timestamp != 0:
-        save(True)
-        CUR_TIMESTAMP = _CUR_TIMESTAMP
-        calcTop(old_timestamp)
+        hashtag_collection.update_one({"name": hashtag}, {"$set": entry}, upsert=True)
 
 
-# Database handling
-
-def save(join: bool = False):
-    global DATA_TAGS, DATA_HASHTAGS, DB
-
-    # To Avoid Random Thread Issues
-    _DATA_TAGS = DATA_TAGS
-    _DATA_HASHTAGS = DATA_HASHTAGS
-
-    DATA_TAGS = {}
-    DATA_HASHTAGS = {}
-
-    t = Thread(name="save", target=_save, args=(_DATA_TAGS, _DATA_HASHTAGS))
-    t.start()
-
-    if join:
-        t.join()
-        print("Save finished sync")
-
-
-def _save(tags: dict, hashtags: dict):
-    start = datetime.datetime.now().timestamp()
-
-    print("Saving.")
-
-    col = DB["tags"]
-
-    uniqueTags = col.count()
-
-    print("Saving " + str(len(tags)) + " tags.")
-    for tag in tags.keys():
-        count = tags[tag]
-        if count >= 2:
-
-            _doc = col.find({"name": tag}).limit(1)
-            doc = {}
-            if _doc.count() == 0:
-                doc = {
-                    "name": tag,
-                    "timeline": []
-                }
-            else:
-                doc = _doc[0]
-
-            if len(doc["timeline"]) != 0 and doc["timeline"][0]["timestamp"] == CUR_TIMESTAMP:
-                doc["timeline"][0]["count"] += count
-            else:
-                doc["timeline"].insert(0, {
-                    "timestamp": CUR_TIMESTAMP,
-                    "count": count
-                })
-
-                col.update_one({"name": tag}, {"$set": doc}, upsert=True)
-
-    col = DB["hashtags"]
-
-    uniqueHashTags = col.count()
-
-    print("Saving " + str(len(hashtags)) + " hashtags.")
-    for hashtag in hashtags.keys():
-        count = hashtags[hashtag]
-        if count >= 2:
-
-            _doc = col.find({"name": hashtag}).limit(1)
-            doc = {}
-            if _doc.count() == 0:
-                doc = {
-                    "name": hashtag,
-                    "timeline": []
-                }
-            else:
-                doc = _doc[0]
-
-            if len(doc["timeline"]) != 0 and doc["timeline"][0]["timestamp"] == CUR_TIMESTAMP:
-                doc["timeline"][0]["count"] += count
-            else:
-                doc["timeline"].insert(0, {
-                    "timestamp": CUR_TIMESTAMP,
-                    "count": count
-                })
-
-                col.update_one({"name": hashtag}, {"$set": doc}, upsert=True)
+def _load_totals():
+    global TOTAL_TWEETS, TOTAL_RETWEETS, TOTAL_HASHTAGS, TOTAL_TAGS, DB
 
     col = DB["totals"]
-    col.update_one({"timestamp": CUR_TIMESTAMP}, {"$set": {
-        "timestamp": CUR_TIMESTAMP,
-        "count_retweets": TOTAL_RETWEETS,
-        "count_tweets": TOTAL_TWEETS,
-        "count_tags": TOTAL_TAGS,
-        "count_hashtags": TOTAL_HASHTAGS,
-        "unique_tags": uniqueTags,
-        "unique_hashtags": uniqueHashTags
-    }}, upsert=True)
+    latest: Cursor = col.find({}).sort("_id", -1).limit(1)
 
-    print("Done. Took " + str(datetime.datetime.now().timestamp() - start) + " seconds.")
+    if latest.count():
+        TOTAL_HASHTAGS = latest[0]["count_hashtags"]
+        TOTAL_TAGS = latest[0]["count_tags"]
+        TOTAL_TWEETS = latest[0]["count_tweets"]
+        TOTAL_RETWEETS = latest[0]["count_retweets"]
 
 
-def loadTotals(db: Database):
-    global TOTAL_TWEETS, TOTAL_RETWEETS, TOTAL_HASHTAGS, TOTAL_TAGS
-
-    col = db["totals"]
-
-    raw = col.find().sort("timestamp", -1).limit(1)
-
-    raw = raw[0]
-
-    TOTAL_TWEETS = raw["count_tweets"]
-    TOTAL_RETWEETS = raw["count_retweets"]
-    TOTAL_TAGS = raw["count_tags"]
-    TOTAL_HASHTAGS = raw["count_hashtags"]
+def _spawn_save_totals():
+    t = Thread(
+        target=_save_totals,
+    )
+    t.start()
 
 
-def calcTop(t: int):
-    print("Calculating tops")
-
+def _save_totals():
     col = DB["tags"]
-    top_tags = col.find({"timeline.0.timestamp": t}).sort("timeline.0.count", -1).limit(100)
-    _top_tags = []
-    for x in top_tags:
-        _top_tags.append(
-            {
-                "name": x["name"],
-                "count": x["timeline"][0]["count"]
-            }
-        )
+    uniqueTags = col.count()
 
     col = DB["hashtags"]
-    top_hashtags = col.find({"timeline.0.timestamp": t}).sort("timeline.0.count", -1).limit(100)
+    uniqueHashTags = col.count()
+
+    col = DB["totals"]
+    col.update_one(
+        {"timestamp": _get_current_timestamp()},
+        {
+            "$set": {
+                "timestamp": _get_current_timestamp(),
+                "count_retweets": TOTAL_RETWEETS,
+                "count_tweets": TOTAL_TWEETS,
+                "count_tags": TOTAL_TAGS,
+                "count_hashtags": TOTAL_HASHTAGS,
+                "unique_tags": uniqueTags,
+                "unique_hashtags": uniqueHashTags,
+            }
+        },
+        upsert=True,
+    )
+
+
+def _spawn_calculate_tops():
+    t = Thread(
+        target=_calculate_tops,
+    )
+    t.start()
+
+
+def _calculate_tops():
+    t = _get_current_timestamp()
+    col = DB["tags"]
+    top_tags = (
+        col.find({"timeline.0.timestamp": t}).sort("timeline.0.count", -1).limit(100)
+    )
+    _top_tags = []
+    for x in top_tags:
+        _top_tags.append({"name": x["name"], "count": x["timeline"][0]["count"]})
+
+    col = DB["hashtags"]
+    top_hashtags = (
+        col.find({"timeline.0.timestamp": t}).sort("timeline.0.count", -1).limit(100)
+    )
     _top_hashtags = []
     for x in top_hashtags:
-        _top_hashtags.append(
-            {
-                "name": x["name"],
-                "count": x["timeline"][0]["count"]
-            }
-        )
+        _top_hashtags.append({"name": x["name"], "count": x["timeline"][0]["count"]})
 
     col = DB["top"]
-    col.insert_one({
-        "timestamp": t,
-        "tags": _top_tags,
-        "hashtags": _top_hashtags
-    })
+    col.insert_one({"timestamp": t, "tags": _top_tags, "hashtags": _top_hashtags})
 
 
 if __name__ == "__main__":
-    mongoClient = MongoClient(
-        os.environ["MONGODB_URI"])
+    mongoClient = MongoClient(_secrets.MONGO_DB_URI)
     DB = mongoClient["TwitterDB"]
-
-    loadTotals(DB)
-    save(True)
+    _load_totals()
 
     connect_to_endpoint()
