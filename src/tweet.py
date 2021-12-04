@@ -1,6 +1,7 @@
 from typing import List
 import emoji
 import string
+import unicodedata
 
 
 class Tweet:
@@ -49,6 +50,8 @@ class Tweet:
         self.tags = self._find("@", forbidden="#")
 
     def _clean(self, text: str, forbidden: List[str]) -> str:
+        text = unicodedata.normalize("NFC", text)
+
         for x in forbidden:
             text = text.replace(x, " ")
         return text
