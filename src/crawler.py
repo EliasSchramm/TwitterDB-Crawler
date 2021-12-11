@@ -115,6 +115,8 @@ def _handle_tweet(text: str, timestamp: str):
                 ] + existing_entry["timeline"]
             entry = existing_entry
 
+        entry["datapoints"] = len(entry["timeline"])
+
         tag_collection.update_one({"name": tag}, {"$set": entry}, upsert=True)
 
     for hashtag in t.hashtags:
@@ -128,6 +130,8 @@ def _handle_tweet(text: str, timestamp: str):
                     {"count": 1, "timestamp": timestamp}
                 ] + existing_entry["timeline"]
             entry = existing_entry
+
+        entry["datapoints"] = len(entry["timeline"])
 
         hashtag_collection.update_one({"name": hashtag}, {"$set": entry}, upsert=True)
 
